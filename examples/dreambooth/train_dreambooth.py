@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import intel_extension_for_pytorch as ipex
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -843,6 +844,9 @@ def main(args):
                 safety_checker=None,
                 revision=args.revision,
             )
+            print("optimizing UNET using Intel Extension for Pytorch")
+            pipeline.unet = ipex.optimize(pipeline.unet.eval(), inplace=True, dtype=torch.bfloat16)
+            
             pipeline.set_progress_bar_config(disable=True)
 
             num_new_images = args.num_class_images - cur_class_images
@@ -1110,9 +1114,11 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move vae and text_encoder to device and cast to weight_dtype
+    vae = ipex.optimize(vae, dtype=torch.bfloat16)
     if vae is not None:
         vae.to(accelerator.device, dtype=weight_dtype)
 
+    text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
     if not args.train_text_encoder and text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
 
@@ -1172,9 +1178,9 @@ def main(args):
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-
+    unet.train()
+    unet, optimizer = ipex.optimize(unet, optimizer=optimizer, dtype=torch.bfloat16)
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
         if args.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
