@@ -108,16 +108,7 @@ DreamBooth for the text encoder was enabled: {train_text_encoder}.
 
 
 def log_validation(
-    text_encoder,
-    tokenizer,
-    unet,
-    vae,
-    args,
-    accelerator,
-    weight_dtype,
-    global_step,
-    prompt_embeds,
-    negative_prompt_embeds,
+    text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch, prompt_embeds, negative_prompt_embeds
 ):
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
@@ -183,7 +174,7 @@ def log_validation(
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, global_step, dataformats="NHWC")
+            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
             tracker.log(
                 {
@@ -387,6 +378,12 @@ def parse_args(input_args=None):
         action="store_true",
         default=False,
         help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--save_infer_steps",
+        type=int,
+        default=20,
+        help="The number of inference steps for save sample.",
     )
     parser.add_argument(
         "--lr_scheduler",
@@ -602,14 +599,14 @@ class DreamBoothDataset(Dataset):
         size=512,
         center_crop=False,
         encoder_hidden_states=None,
-        class_prompt_encoder_hidden_states=None,
+        instance_prompt_encoder_hidden_states=None,
         tokenizer_max_length=None,
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
         self.encoder_hidden_states = encoder_hidden_states
-        self.class_prompt_encoder_hidden_states = class_prompt_encoder_hidden_states
+        self.instance_prompt_encoder_hidden_states = instance_prompt_encoder_hidden_states
         self.tokenizer_max_length = tokenizer_max_length
 
         self.instance_data_root = Path(instance_data_root)
@@ -672,8 +669,8 @@ class DreamBoothDataset(Dataset):
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
 
-            if self.class_prompt_encoder_hidden_states is not None:
-                example["class_prompt_ids"] = self.class_prompt_encoder_hidden_states
+            if self.instance_prompt_encoder_hidden_states is not None:
+                example["class_prompt_ids"] = self.instance_prompt_encoder_hidden_states
             else:
                 class_text_inputs = tokenize_prompt(
                     self.tokenizer, self.class_prompt, tokenizer_max_length=self.tokenizer_max_length
@@ -846,7 +843,6 @@ def main(args):
             )
             print("optimizing UNET using Intel Extension for Pytorch")
             pipeline.unet = ipex.optimize(pipeline.unet.eval(), inplace=True, dtype=torch.bfloat16)
-            
             pipeline.set_progress_bar_config(disable=True)
 
             num_new_images = args.num_class_images - cur_class_images
@@ -857,16 +853,17 @@ def main(args):
 
             sample_dataloader = accelerator.prepare(sample_dataloader)
             pipeline.to(accelerator.device)
+                
+            with torch.no_grad(), torch.cpu.amp.autocast():
+                for example in tqdm(
+                    sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                ):
+                    images = pipeline(example["prompt"], num_inference_steps=args.save_infer_steps).images
 
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
+                    for i, image in enumerate(images):
+                        hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image.save(image_filename)
 
             del pipeline
             if torch.cuda.is_available():
@@ -908,11 +905,11 @@ def main(args):
         )
     else:
         vae = None
-
+    #vae = ipex.optimize(vae, dtype=torch.bfloat16)
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
-
+    
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
         for model in models:
@@ -1040,10 +1037,10 @@ def main(args):
         else:
             validation_prompt_encoder_hidden_states = None
 
-        if args.class_prompt is not None:
-            pre_computed_class_prompt_encoder_hidden_states = compute_text_embeddings(args.class_prompt)
+        if args.instance_prompt is not None:
+            pre_computed_instance_prompt_encoder_hidden_states = compute_text_embeddings(args.instance_prompt)
         else:
-            pre_computed_class_prompt_encoder_hidden_states = None
+            pre_computed_instance_prompt_encoder_hidden_states = None
 
         text_encoder = None
         tokenizer = None
@@ -1054,7 +1051,7 @@ def main(args):
         pre_computed_encoder_hidden_states = None
         validation_prompt_encoder_hidden_states = None
         validation_prompt_negative_prompt_embeds = None
-        pre_computed_class_prompt_encoder_hidden_states = None
+        pre_computed_instance_prompt_encoder_hidden_states = None
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -1067,7 +1064,7 @@ def main(args):
         size=args.resolution,
         center_crop=args.center_crop,
         encoder_hidden_states=pre_computed_encoder_hidden_states,
-        class_prompt_encoder_hidden_states=pre_computed_class_prompt_encoder_hidden_states,
+        instance_prompt_encoder_hidden_states=pre_computed_instance_prompt_encoder_hidden_states,
         tokenizer_max_length=args.tokenizer_max_length,
     )
 
@@ -1114,14 +1111,14 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move vae and text_encoder to device and cast to weight_dtype
-    vae = ipex.optimize(vae, dtype=torch.bfloat16)
     if vae is not None:
         vae.to(accelerator.device, dtype=weight_dtype)
-
-    text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
+        
+    vae = ipex.optimize(vae, dtype=torch.bfloat16)
     if not args.train_text_encoder and text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-
+        
+    text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1178,8 +1175,10 @@ def main(args):
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    
     unet.train()
     unet, optimizer = ipex.optimize(unet, optimizer=optimizer, dtype=torch.bfloat16)
+    
     for epoch in range(first_epoch, args.num_train_epochs):
         if args.train_text_encoder:
             text_encoder.train()
@@ -1194,8 +1193,9 @@ def main(args):
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
 
                 if vae is not None:
-                    # Convert images to latent space
-                    model_input = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                    with torch.cpu.amp.autocast():
+                        # Convert images to latent space
+                        model_input = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                     model_input = model_input * vae.config.scaling_factor
                 else:
                     model_input = pixel_values
@@ -1222,12 +1222,13 @@ def main(args):
                 if args.pre_compute_text_embeddings:
                     encoder_hidden_states = batch["input_ids"]
                 else:
-                    encoder_hidden_states = encode_prompt(
-                        text_encoder,
-                        batch["input_ids"],
-                        batch["attention_mask"],
-                        text_encoder_use_attention_mask=args.text_encoder_use_attention_mask,
-                    )
+                    with torch.cpu.amp.autocast():
+                        encoder_hidden_states = encode_prompt(
+                            text_encoder,
+                            batch["input_ids"],
+                            batch["attention_mask"],
+                            text_encoder_use_attention_mask=args.text_encoder_use_attention_mask,
+                        )
 
                 if accelerator.unwrap_model(unet).config.in_channels == channels * 2:
                     noisy_model_input = torch.cat([noisy_model_input, noisy_model_input], dim=1)
@@ -1238,9 +1239,10 @@ def main(args):
                     class_labels = None
 
                 # Predict the noise residual
-                model_pred = unet(
-                    noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels
-                ).sample
+                with torch.cpu.amp.autocast():
+                    model_pred = unet(
+                        noisy_model_input, timesteps, encoder_hidden_states, class_labels=class_labels
+                    ).sample
 
                 if model_pred.shape[1] == 6:
                     model_pred, _ = torch.chunk(model_pred, 2, dim=1)
@@ -1315,18 +1317,19 @@ def main(args):
                     images = []
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        images = log_validation(
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            vae,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                            validation_prompt_encoder_hidden_states,
-                            validation_prompt_negative_prompt_embeds,
-                        )
+                        with torch.cpu.amp.autocast():
+                            images = log_validation(
+                                text_encoder,
+                                tokenizer,
+                                unet,
+                                vae,
+                                args,
+                                accelerator,
+                                weight_dtype,
+                                epoch,
+                                validation_prompt_encoder_hidden_states,
+                                validation_prompt_negative_prompt_embeds,
+                            )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
