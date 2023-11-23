@@ -978,18 +978,18 @@ def main(args):
     #accelerator.register_load_state_pre_hook(load_model_hook)
 
     if vae is not None:
-        vae.requires_grad_(False)
         if args.use_bf16 and args.ipex:
-            text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
+            vae = ipex.optimize(vae, dtype=torch.bfloat16)
         else:
-            text_encoder = ipex.optimize(text_encoder, dtype=torch.float32)
+            vae = ipex.optimize(vae, dtype=torch.float32)
+        vae.requires_grad_(False)
 
     if not args.train_text_encoder:
-        text_encoder.requires_grad_(False)
         if args.use_bf16 and args.ipex:
             text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
         else:
             text_encoder = ipex.optimize(text_encoder, dtype=torch.float32)
+        text_encoder.requires_grad_(False)
         
 
     if args.enable_xformers_memory_efficient_attention:
