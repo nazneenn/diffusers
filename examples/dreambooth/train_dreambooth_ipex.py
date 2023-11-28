@@ -980,17 +980,20 @@ def main(args):
     if vae is not None:
         if args.use_bf16 and args.ipex:
             vae = ipex.optimize(vae, dtype=torch.bfloat16)
-        else:
+            vae = torch.compile(vae, backend="ipex")
+        if args.ipex and not args.use_bf16:
             vae = ipex.optimize(vae, dtype=torch.float32)
+            vae = torch.compile(vae, backend="ipex")
         vae.requires_grad_(False)
-
+        
     if not args.train_text_encoder:
         if args.use_bf16 and args.ipex:
             text_encoder = ipex.optimize(text_encoder, dtype=torch.bfloat16)
-        else:
+            text_encoder = torch.compile(text_encoder, backend="ipex")
+        if args.ipex and not args.use_bf16:
             text_encoder = ipex.optimize(text_encoder, dtype=torch.float32)
+            text_encoder = torch.compile(text_encoder, backend="ipex")
         text_encoder.requires_grad_(False)
-        
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1239,16 +1242,20 @@ def main(args):
         
         if args.use_bf16 and args.ipex:
             text_encoder,optimizer = ipex.optimize(text_encoder, optimizer=optimizer, dtype=torch.bfloat16)
-        else:
+        if args.ipex and not args.ipex:
             text_encoder,optimizer = ipex.optimize(text_encoder, optimizer=optimizer, dtype=torch.float32)
             
     unet.train()
     
     if args.use_bf16 and args.ipex:
         unet, optimizer = ipex.optimize(unet, optimizer=optimizer, dtype=torch.bfloat16)
+        unet = torch.compile(unet, backend="ipex")
         amp_enabled = True
-    else:
+    elif args.ipex and not args.use_bf16:
         unet, optimizer = ipex.optimize(unet, optimizer=optimizer, dtype=torch.float32)
+        unet = torch.compile(unet, backend="ipex")
+        amp_enabled = False
+    else:
         amp_enabled = False
     
     
